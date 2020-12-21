@@ -1,0 +1,107 @@
+#!/home/roham/miniconda3/bin/snakemake --snakefile
+import os
+"""
+This Snakemake pipeline takes the output of a nanopore sequencing run and:
+    * Aligns to the reference genome with minimap2
+    * Calls methylation with Nanopolish
+    * Formats methylation calls with nanopore-methylation-utilities
+"""
+configfile: "config.yaml"
+###-------input paths/files (I should use a config file before commit) -------###
+fastqpath= config["fastqdir"]
+fast5path= config["fast5"]
+cores=config["cores"]
+base_out_path = config["out"]  # the base directory of outputs, alignment and methylation directories will be created inside this directory
+ref = config["reference"]
+nanopolish = config["nanopolish"]
+minimap = config["minimap2"]
+util = config["nanopore-methylation-utilities"]
+###--------------###
+###------- Extract sample names from fsatq directory -------###
+SAMPLESLONG = [f.split(".")[0] for f in os.listdir(fastqpath) if f.endswith('.fastq')]
+print(str(len(SAMPLESLONG)) + " samples will be processed!")
+print(SAMPLESLONG)
+print(fastqpath)
+# print(str(SAMPLES))
+# ###--------------###
+# ###------- Pipeline Rules -------#####
+rule all:
+    input:
+        expand( base_out_path + "/meth_calls/{sample1}_meth.bam", sample1=SAMPLESLONG)
+rule align:
+    input:
+        fastq = fastqpath + "/{sample1}.fastq",
+        ann = ref
+    output:
+        base_out_path + "/bam/{sample1}.bam"
+    threads: 24
+    params:
+        cores = cores,
+        DIR = base_out_path + "/bam",
+        file = "{sample1}.bam"
+    message: """Aligning to human reference with minimap2"""
+    shell:"""
+        {minimap} -ax map-ont -t {params.cores} {input.ann} {input.fastq} | samtools view -S -b | samtools sort -o {output}
+	samtools index {params.DIR}/{params.file}
+    """
+rule nanpolish:
+    input:
+    #	expand( base_out_path + "/bam/{sample1}.bam", sample1=SAMPLESLONG),
+        fastq = fastqpath + "/{sample1}.fastq",
+        fast5 = fast5path,
+        bam = base_out_path + "/bam/{sample1}.bam"
+    output:
+        base_out_path + "/meth_calls/{sample1}_CpG_methylation.tsv"
+    params:
+        DIR = base_out_path + "/meth_calls",
+        cores = cores,
+        file = "{sample1}_CpG_methylation.tsv"
+    message: """calling methylation with nanopolish"""
+    shell:"""
+    	{nanopolish}/nanopolish index -d {input.fast5} {input.fastq}
+	{nanopolish}/nanopolish call-methylation -b {input.bam} -r {input.fastq} -g {rules.align.input.ann} -q cpg -t {params.cores} --progress > {params.DIR}/{params.file}
+    """
+    #/home/isac/Software/nanopolish/nanopolish index -d {input.fast5} {input.fastq}
+rule methylbed:
+    input:
+     #   expand( base_out_path + "/meth_calls/{sample1}_CpG_methylation.tsv", sample1=SAMPLESLONG),
+        tsv = base_out_path + "/meth_calls/{sample1}_CpG_methylation.tsv"
+    output:
+        base_out_path + "/meth_calls/{sample1}_CpG_methylation.bed.gz"
+    params:
+        DIR = base_out_path + "/meth_calls",
+        file = "{sample1}_CpG_methylation.bed.gz",
+        tmp =  "{sample1}_CpG_methylation.bed.tmp",
+        ref = ref,
+        cores = cores
+    message: """format methyl bed"""
+    shell:"""
+	python3 {util}/mtsv2bedGraph.py -q cpg -c 1.5 -g {ref} -i {input.tsv} > {params.DIR}/{params.tmp} 
+	sort {params.DIR}/{params.tmp} -k1,1 -k2,2n | bgzip > {params.DIR}/{params.file}
+	tabix -p bed {params.DIR}/{params.file}
+	rm {params.DIR}/{params.tmp}
+    """
+rule methylbam:
+    input:
+     #   expand( base_out_path + "/meth_calls/{sample1}_CpG_methylation.tsv", sample1=SAMPLESLONG),
+        bam = base_out_path + "/bam/{sample1}.bam",
+        tsv = rules.methylbed.output
+    output:
+        base_out_path + "/meth_calls/{sample1}_meth.bam"
+    params:
+        DIR = base_out_path + "/meth_calls",
+        file = "{sample1}_CpG_methylation.bed.gz",
+        filt =  "{sample1}_filter.bam",
+        methbam = "{sample1}_meth.bam",
+        ref = ref,
+        cores = cores
+    message: """convert bam for methylation"""
+    shell:"""
+        samtools view -h -b -F 272 {input.bam} > {params.DIR}/{params.filt}
+        samtools index {params.DIR}/{params.filt}
+        python3 {util}/convert_bam_for_methylation.py -t {params.cores} --verbose -b {params.DIR}/{params.filt} \
+               -c {input.tsv} -f {ref} |\
+                samtools sort -o {params.DIR}/{params.methbam}
+        samtools index {params.DIR}/{params.methbam}
+    """
+# ###--------------###
